@@ -1,0 +1,404 @@
+import telebot
+import yaml
+import sqlite3
+from abc import ABC, abstractmethod
+from datetime import datetime, timedelta
+from apscheduler.schedulers.background import BackgroundScheduler
+import os
+from dotenv import load_dotenv
+
+# Загрузка конфигурации из файла config.yaml
+with open("config.yaml", "r", encoding="utf-8") as file:
+    CONFIG = yaml.safe_load(file)
+
+TOKEN = CONFIG["telegram_token"]
+DB_PATH = CONFIG["database_path"]
+REMINDER_TIMES = CONFIG["reminder_times"]
+
+bot = telebot.TeleBot(TOKEN)
+scheduler = BackgroundScheduler()
+scheduler.start()
+
+# Глобальные словари для хранения состояния и языка пользователей
+user_states = {}
+user_languages = {}
+
+# ============================
+# Абстракция для работы с базой данных
+# ============================
+class DatabaseAdapter(ABC):
+    @abstractmethod
+    def connect(self):
+        pass
+
+    @abstractmethod
+    def save_task(self, task):
+        pass
+
+    @abstractmethod
+    def load_tasks(self, user_id):
+        pass
+
+    @abstractmethod
+    def delete_task(self, user_id, title):
+        pass
+
+    @abstractmethod
+    def update_task_description(self, user_id, title, new_description):
+        pass
+
+# Реализация для SQLite
+class SQLiteAdapter(DatabaseAdapter):
+    def __init__(self, db_path):
+        self.db_path = db_path
+        self.connect()
+
+    def connect(self):
+        self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        self.cursor = self.conn.cursor()
+        self.cursor.execute("""
+            CREATE TABLE IF NOT EXISTS tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                title TEXT,
+                description TEXT,
+                deadline TEXT,
+                priority TEXT,
+                category TEXT,
+                completed INTEGER
+            )
+        """)
+        self.conn.commit()
+
+    def save_task(self, task):
+        self.cursor.execute("""
+            INSERT INTO tasks (user_id, title, description, deadline, priority, category, completed)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (
+            task.user_id,
+            task.title,
+            task.description,
+            task.deadline.strftime("%Y-%m-%d %H:%M"),
+            task.priority,
+            task.category,
+            int(task.completed)
+        ))
+        self.conn.commit()
+
+    def load_tasks(self, user_id):
+        self.cursor.execute("SELECT * FROM tasks WHERE user_id = ?", (user_id,))
+        return self.cursor.fetchall()
+
+    def delete_task(self, user_id, title):
+        self.cursor.execute("DELETE FROM tasks WHERE user_id = ? AND title = ?", (user_id, title))
+        self.conn.commit()
+
+    def update_task_description(self, user_id, title, new_description):
+        self.cursor.execute("UPDATE tasks SET description = ? WHERE user_id = ? AND title = ?",
+                            (new_description, user_id, title))
+        self.conn.commit()
+
+# ============================
+# Модель задачи и категории
+# ============================
+class Task:
+    def __init__(self, user_id, title, description, deadline, priority, category, completed=False):
+        self.user_id = user_id
+        self.title = title
+        self.description = description
+        self.deadline = deadline  # объект datetime
+        self.priority = priority
+        self.category = category
+        self.completed = completed
+
+    def mark_completed(self):
+        self.completed = True
+
+    def to_dict(self):
+        return {
+            "user_id": self.user_id,
+            "title": self.title,
+            "description": self.description,
+            "deadline": self.deadline.strftime("%Y-%m-%d %H:%M"),
+            "priority": self.priority,
+            "category": self.category,
+            "completed": self.completed
+        }
+
+class TaskCategory(ABC):
+    @abstractmethod
+    def get_display_name(self):
+        pass
+
+class WorkCategory(TaskCategory):
+    def get_display_name(self):
+        return "Работа"
+
+class StudyCategory(TaskCategory):
+    def get_display_name(self):
+        return "Учёба"
+
+class PersonalCategory(TaskCategory):
+    def get_display_name(self):
+        return "Личное"
+
+# ============================
+# Стратегия напоминаний
+# ============================
+class ReminderStrategy(ABC):
+    @abstractmethod
+    def calculate_reminder_time(self, deadline):
+        pass
+
+class OneDayReminder(ReminderStrategy):
+    def calculate_reminder_time(self, deadline):
+        return deadline - timedelta(days=1)
+
+class OneHourReminder(ReminderStrategy):
+    def calculate_reminder_time(self, deadline):
+        return deadline - timedelta(hours=1)
+
+class FifteenMinuteReminder(ReminderStrategy):
+    def calculate_reminder_time(self, deadline):
+        return deadline - timedelta(minutes=15)
+
+class OneWeekReminder(ReminderStrategy):
+    def calculate_reminder_time(self, deadline):
+        return deadline - timedelta(weeks=1)
+
+# ============================
+# Заглушка для интеграции с Google Calendar
+# ============================
+class GoogleCalendarAdapter:
+    """Заглушка для интеграции с Google Calendar."""
+    def add_task_to_calendar(self, task):
+        # Будет реализовано в будущем
+        pass
+
+    def fetch_tasks(self):
+        # Будет реализовано в будущем
+        pass
+
+# ============================
+# Менеджер задач
+# ============================
+class TaskManager:
+    def __init__(self, db_adapter):
+        self.db_adapter = db_adapter
+
+    def save_task(self, task):
+        self.db_adapter.save_task(task)
+
+    def load_tasks(self, user_id):
+        return self.db_adapter.load_tasks(user_id)
+
+    def delete_task(self, user_id, title):
+        self.db_adapter.delete_task(user_id, title)
+
+    def update_task_description(self, user_id, title, new_description):
+        self.db_adapter.update_task_description(user_id, title, new_description)
+
+    def schedule_reminder(self, task, reminder_strategy):
+        reminder_time = reminder_strategy.calculate_reminder_time(task.deadline)
+        if reminder_time > datetime.now():
+            scheduler.add_job(send_reminder, 'date', run_date=reminder_time, args=[task])
+
+    def sync_with_google_calendar(self):
+        # Заглушка для будущей интеграции с Google Calendar
+        pass
+
+# Функция для отправки уведомления о задаче
+def send_reminder(task):
+    bot.send_message(
+        task.user_id,
+        f"Напоминание: Задача '{task.title}' скоро истекает! Срок: {task.deadline.strftime('%Y-%m-%d %H:%M')}"
+    )
+
+# Инициализация менеджера задач
+db_adapter = SQLiteAdapter(DB_PATH)
+task_manager = TaskManager(db_adapter)
+
+# ============================
+# Обработчики команд бота
+# ============================
+
+# /start — приветствие и вывод списка команд
+@bot.message_handler(commands=['start'])
+def send_welcome(message):
+    chat_id = message.chat.id
+    bot.send_message(chat_id,
+                     "Привет! Я помогу тебе управлять задачами.\n"
+                     "Доступные команды:\n"
+                     "/add - добавить задачу\n"
+                     "/edit - редактировать задачу\n"
+                     "/delete - удалить задачу\n"
+                     "/stats - статистика задач\n"
+                     "/language - смена языка\n"
+                     "/sync - синхронизация с Google Calendar")
+
+# /add — добавление задачи через пошаговый диалог
+@bot.message_handler(commands=['add'])
+def add_task_start(message):
+    chat_id = message.chat.id
+    user_states[chat_id] = {}
+    bot.send_message(chat_id, "Введите название задачи:")
+    bot.register_next_step_handler(message, process_title)
+
+def process_title(message):
+    chat_id = message.chat.id
+    user_states[chat_id]['title'] = message.text
+    bot.send_message(chat_id, "Введите описание задачи:")
+    bot.register_next_step_handler(message, process_description)
+
+def process_description(message):
+    chat_id = message.chat.id
+    user_states[chat_id]['description'] = message.text
+    bot.send_message(chat_id, "Введите срок выполнения (формат YYYY-MM-DD HH:MM):")
+    bot.register_next_step_handler(message, process_deadline)
+
+def process_deadline(message):
+    chat_id = message.chat.id
+    try:
+        deadline = datetime.strptime(message.text, "%Y-%m-%d %H:%M")
+        user_states[chat_id]['deadline'] = deadline
+        bot.send_message(chat_id, "Выберите приоритет (высокий, средний, низкий):")
+        bot.register_next_step_handler(message, process_priority)
+    except ValueError:
+        bot.send_message(chat_id, "Неверный формат даты. Попробуйте еще раз (YYYY-MM-DD HH:MM):")
+        bot.register_next_step_handler(message, process_deadline)
+
+def process_priority(message):
+    chat_id = message.chat.id
+    if message.text.lower() in ['высокий', 'средний', 'низкий']:
+        user_states[chat_id]['priority'] = message.text.lower()
+        bot.send_message(chat_id, "Выберите категорию (работа, учеба, личное):")
+        bot.register_next_step_handler(message, process_category)
+    else:
+        bot.send_message(chat_id, "Пожалуйста, выберите один из вариантов: высокий, средний, низкий.")
+        bot.register_next_step_handler(message, process_priority)
+
+def process_category(message):
+    chat_id = message.chat.id
+    category_text = message.text.lower()
+    if category_text == 'работа':
+        user_states[chat_id]['category'] = WorkCategory().get_display_name()
+    elif category_text == 'учеба':
+        user_states[chat_id]['category'] = StudyCategory().get_display_name()
+    elif category_text == 'личное':
+        user_states[chat_id]['category'] = PersonalCategory().get_display_name()
+    else:
+        bot.send_message(chat_id, "Пожалуйста, выберите один из вариантов: работа, учеба, личное.")
+        bot.register_next_step_handler(message, process_category)
+        return
+    bot.send_message(chat_id, "Выберите время напоминания: 1 день, 1 час, 15 минут, 1 неделя")
+    bot.register_next_step_handler(message, process_reminder)
+
+def process_reminder(message):
+    chat_id = message.chat.id
+    reminder_text = message.text.lower()
+    reminder_strategy = None
+    if reminder_text == '1 день':
+        reminder_strategy = OneDayReminder()
+    elif reminder_text == '1 час':
+        reminder_strategy = OneHourReminder()
+    elif reminder_text == '15 минут':
+        reminder_strategy = FifteenMinuteReminder()
+    elif reminder_text == '1 неделя':
+        reminder_strategy = OneWeekReminder()
+    else:
+        bot.send_message(chat_id, "Пожалуйста, выберите один из вариантов: 1 день, 1 час, 15 минут, 1 неделя.")
+        bot.register_next_step_handler(message, process_reminder)
+        return
+
+    state = user_states.get(chat_id, {})
+    task = Task(
+        user_id=chat_id,
+        title=state['title'],
+        description=state['description'],
+        deadline=state['deadline'],
+        priority=state['priority'],
+        category=state['category'],
+        completed=False
+    )
+    task_manager.save_task(task)
+    task_manager.schedule_reminder(task, reminder_strategy)
+    bot.send_message(chat_id, f"Задача '{task.title}' успешно добавлена и напоминание запланировано!")
+    user_states.pop(chat_id, None)
+
+# /stats — вывод статистики выполненных задач
+@bot.message_handler(commands=['stats'])
+def send_stats(message):
+    chat_id = message.chat.id
+    tasks_data = task_manager.load_tasks(chat_id)
+    total_tasks = len(tasks_data)
+    completed_tasks = sum(1 for t in tasks_data if t[7] == 1)  # t[7] – поле completed
+    completion_rate = (completed_tasks / total_tasks * 100) if total_tasks > 0 else 0
+    bot.send_message(chat_id,
+                     f"Статистика задач:\nВсего: {total_tasks}\nВыполнено: {completed_tasks}\nПроцент выполнения: {completion_rate:.2f}%")
+
+# /delete — удаление задачи
+@bot.message_handler(commands=['delete'])
+def delete_task(message):
+    chat_id = message.chat.id
+    bot.send_message(chat_id, "Введите название задачи, которую нужно удалить:")
+    bot.register_next_step_handler(message, process_delete_task)
+
+def process_delete_task(message):
+    chat_id = message.chat.id
+    title = message.text
+    task_manager.delete_task(chat_id, title)
+    bot.send_message(chat_id, f"Задача '{title}' удалена.")
+
+# /edit — редактирование описания задачи
+@bot.message_handler(commands=['edit'])
+def edit_task(message):
+    chat_id = message.chat.id
+    bot.send_message(chat_id, "Введите название задачи, которую хотите отредактировать:")
+    bot.register_next_step_handler(message, process_edit_task)
+
+def process_edit_task(message):
+    chat_id = message.chat.id
+    title = message.text
+    tasks_data = task_manager.load_tasks(chat_id)
+    matching_tasks = [t for t in tasks_data if t[2] == title]  # t[2] – название задачи
+    if not matching_tasks:
+        bot.send_message(chat_id, f"Задача с названием '{title}' не найдена.")
+        return
+    task_data = matching_tasks[0]
+    bot.send_message(chat_id, f"Введите новое описание для задачи '{title}':")
+    bot.register_next_step_handler(message, lambda msg: process_new_description(msg, task_data))
+
+def process_new_description(message, task_data):
+    chat_id = message.chat.id
+    new_description = message.text
+    task_manager.update_task_description(chat_id, task_data[2], new_description)
+    bot.send_message(chat_id, f"Задача '{task_data[2]}' успешно обновлена.")
+
+# /sync — заглушка для синхронизации с Google Calendar
+@bot.message_handler(commands=['sync'])
+def sync_calendar(message):
+    chat_id = message.chat.id
+    task_manager.sync_with_google_calendar()
+    bot.send_message(chat_id, "Синхронизация с Google Calendar выполнена (заглушка).")
+
+# /language — смена языка
+@bot.message_handler(commands=['language'])
+def set_language(message):
+    chat_id = message.chat.id
+    bot.send_message(chat_id, "Выберите язык / Choose language: ru / en")
+    bot.register_next_step_handler(message, process_language)
+
+def process_language(message):
+    chat_id = message.chat.id
+    lang = message.text.lower()
+    if lang in ['ru', 'en']:
+        user_languages[chat_id] = lang
+        bot.send_message(chat_id, f"Язык изменен на {lang}.")
+    else:
+        bot.send_message(chat_id, "Неверный выбор. Попробуйте еще раз.")
+        bot.register_next_step_handler(message, process_language)
+
+# ============================
+# Запуск бота
+# ============================
+bot.polling(none_stop=True)

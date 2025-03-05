@@ -1,0 +1,4 @@
+telebot~=0.0.5
+pyTelegramBotAPI~=4.26.0
+PyYAML~=6.0.2
+python-dotenv~=1.0.1
